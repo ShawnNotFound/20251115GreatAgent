@@ -1,0 +1,11 @@
+/.env
+/.langflow_config_backup
+/langflow_error.log
+/langflow_error_env.log
+/langflow_run.log
+/langflow_run2.log
+/langflow_run3.log
+/langflow_run4.log
+/langflow_run5.log
+/langflow_run6.log
+/__pycache__
