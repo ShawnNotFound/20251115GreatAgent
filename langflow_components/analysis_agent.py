@@ -1,10 +1,8 @@
 from langflow.custom import CustomComponent
-from pydantic import BaseModel
-from .trace_logger import log_trace
 
-class AnalysisOut(BaseModel):
-    options: list[str]
-    rationale: str
+from langflow_components.__schemas import AnalysisOut
+from langflow_components.__trace_logger import log_trace
+
 
 class AnalysisAgent(CustomComponent):
     display_name = "Analysis Agent"

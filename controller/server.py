@@ -1,8 +1,18 @@
 import asyncio, json, uuid, time
+from enum import Enum
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, Field
+
+from langflow_components.input_agent import InputAgent
+from langflow_components.task_decomposer import TaskDecomposer
+from langflow_components.workflow_orchestrator import WorkflowOrchestrator
+from langflow_components.research_agent import ResearchAgent
+from langflow_components.human_selection_gate import HumanSelectionGate
+from langflow_components.analysis_agent import AnalysisAgent
+from langflow_components.validation_agent import ValidationAgent
+from langflow_components.output_agent import OutputAgent
 
 app = FastAPI(title="AgentGlassFlow Controller")
 
@@ -10,7 +20,7 @@ app = FastAPI(title="AgentGlassFlow Controller")
 RUNS: dict[str, dict] = {}
 EVENT_QUEUES: dict[str, asyncio.Queue] = {}
 
-class RunMode(str):
+class RunMode(str, Enum):
     AUTO = "auto"
     HUMAN = "human"
 
@@ -39,7 +49,7 @@ async def start_run(req: StartRunReq):
         "mode": req.mode,
         "status": "running",
         "cursor": "TaskDecomposer",
-        "store": {"user_query": req.user_query, "selections": {}},
+        "store": {"user_query": req.user_query, "selections": {}, "segments": {}},
         "paused": False,
         "stop": False,
     }
@@ -50,11 +60,24 @@ async def start_run(req: StartRunReq):
 async def events(run_id: str):
     if run_id not in RUNS:
         raise HTTPException(404, "run not found")
+
     async def gen():
-        while RUNS.get(run_id) and RUNS[run_id]["status"] in ("running","paused","awaiting_selection"):
-            item = await EVENT_QUEUES[run_id].get()
-            yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-        yield f"event: end\ndata: {{\"run_id\":\"{run_id}\"}}\n\n"
+        queue = EVENT_QUEUES.get(run_id)
+        while RUNS.get(run_id):
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=0.1)
+                yield {
+                    "event": item["event"],
+                    "data": json.dumps(item["data"], ensure_ascii=False),
+                }
+                if item["event"] in {"done", "error", "stopping"}:
+                    break
+            except asyncio.TimeoutError:
+                status = RUNS[run_id]["status"]
+                if status in {"done", "error", "stopping"} and queue.empty():
+                    break
+        yield {"event": "end", "data": json.dumps({"run_id": run_id})}
+
     return EventSourceResponse(gen())
 
 @app.post("/pause/{run_id}")
@@ -93,54 +116,106 @@ async def select(req: SelectionReq):
 # --- Demo pipeline runner (mock calls). Replace with Langflow API calls if desired.
 async def _run_pipeline(run_id: str):
     run = RUNS[run_id]
+    mode_label = "engage_human" if run["mode"] == RunMode.HUMAN else "agents_only"
+
+    async def record(node: str, inputs: dict, output: dict):
+        run["store"]["segments"][node] = {"input": inputs, "output": output}
+        await emit(run_id, "segment", {"node": node, "input": inputs, "output": output})
+
     try:
-        # Step 1: TaskDecomposer
+        # Input Agent
+        await _wait_ok(run_id)
+        await emit(run_id, "enter", {"node": "InputAgent"})
+        intake_inputs = {
+            "user_query": run["store"]["user_query"],
+            "preferred_mode": mode_label,
+        }
+        intake = InputAgent().build(**intake_inputs)
+        await emit(run_id, "exit", {"node": "InputAgent", "output": intake})
+        await record("InputAgent", intake_inputs, intake)
+
+        # Task Decomposer
         await _wait_ok(run_id)
         await emit(run_id, "enter", {"node": "TaskDecomposer"})
-        plan = ["ResearchAgent", "AnalysisAgent", "ValidationAgent", "OutputAgent"]
-        await emit(run_id, "exit", {"node": "TaskDecomposer", "output": {"workflow_plan": plan}})
+        plan = TaskDecomposer().build(intake["normalized_query"])
+        await emit(run_id, "exit", {"node": "TaskDecomposer", "output": plan})
+        await record("TaskDecomposer", {"user_query": intake["normalized_query"]}, plan)
 
-        # Step 2: ResearchAgent (multi-output)
+        # Workflow Orchestrator
         await _wait_ok(run_id)
-        await emit(run_id, "enter", {"node": "ResearchAgent"})
-        candidates = ["[A] Focused", "[B] Broad", "[C] Counterpoints"]
-        await emit(run_id, "candidates", {"node": "ResearchAgent", "candidates": candidates})
+        workflow = WorkflowOrchestrator().build(
+            workflow_plan=plan["workflow_plan"],
+            engagement_mode=intake["engagement_mode"],
+            tools_needed=intake["tools_needed"],
+        )
+        await emit(run_id, "workflow", workflow)
+        await record("WorkflowOrchestrator", {"plan": plan["workflow_plan"]}, workflow)
 
-        choice_idx = 0
-        if run["mode"] == "human":
-            run["status"] = "awaiting_selection"
-            await emit(run_id, "awaiting_selection", {"node": "ResearchAgent"})
-            # Wait until /select sets a choice for this node
-            while run["status"] == "awaiting_selection":
-                await asyncio.sleep(0.1)
-            choice_idx = run["store"]["selections"].get("ResearchAgent", 0)
-        await emit(run_id, "exit", {"node": "ResearchAgent", "selected": candidates[choice_idx]})
+        # Step through planned agents
+        selected_research = intake["normalized_query"]
+        selected_analysis = ""
+        analysis_options = []
+        validation = {}
+        final_text = ""
+        for node in plan["workflow_plan"]:
+            await _wait_ok(run_id)
+            await emit(run_id, "enter", {"node": node})
 
-        # Step 3: AnalysisAgent (multi-output)
-        await _wait_ok(run_id)
-        await emit(run_id, "enter", {"node": "AnalysisAgent"})
-        options = ["Concise reasoning", "Detailed trade-offs"]
-        await emit(run_id, "options", {"node": "AnalysisAgent", "options": options})
-        choice_idx = 0
-        if run["mode"] == "human":
-            run["status"] = "awaiting_selection"
-            await emit(run_id, "awaiting_selection", {"node": "AnalysisAgent"})
-            while run["status"] == "awaiting_selection":
-                await asyncio.sleep(0.1)
-            choice_idx = run["store"]["selections"].get("AnalysisAgent", 0)
-        await emit(run_id, "exit", {"node": "AnalysisAgent", "selected": options[choice_idx]})
+            if node == "ResearchAgent":
+                research = ResearchAgent().build(intake["normalized_query"])
+                await emit(run_id, "options", {"node": node, "options": research["candidates"]})
+                choice_idx = 0
+                if mode_label == "engage_human":
+                    run["status"] = "awaiting_selection"
+                    await emit(run_id, "awaiting_selection", {"node": node})
+                    while run["status"] == "awaiting_selection":
+                        await asyncio.sleep(0.1)
+                    choice_idx = run["store"]["selections"].get(node, 0)
+                    run["status"] = "running"
+                selection = HumanSelectionGate().build(
+                    options=research["candidates"],
+                    engagement_mode=mode_label,
+                    selection_index=choice_idx,
+                )
+                selected_research = selection["selected"]
+                segment_output = {
+                    "candidates": research["candidates"],
+                    "selection": selection,
+                }
+                await emit(run_id, "exit", {"node": node, "selected": selected_research})
+                await record(node, {"query": intake["normalized_query"]}, segment_output)
 
-        # Step 4: ValidationAgent
-        await _wait_ok(run_id)
-        await emit(run_id, "enter", {"node": "ValidationAgent"})
-        validation = {"is_consistent": True, "confidence": 0.82}
-        await emit(run_id, "exit", {"node": "ValidationAgent", "output": validation})
+            elif node == "AnalysisAgent":
+                analysis = AnalysisAgent().build(selected_input=selected_research, candidates=None)
+                analysis_options = analysis["options"]
+                await emit(run_id, "options", {"node": node, "options": analysis_options})
+                choice_idx = 0
+                if mode_label == "engage_human":
+                    run["status"] = "awaiting_selection"
+                    await emit(run_id, "awaiting_selection", {"node": node})
+                    while run["status"] == "awaiting_selection":
+                        await asyncio.sleep(0.1)
+                    choice_idx = run["store"]["selections"].get(node, 0)
+                    run["status"] = "running"
+                selection = HumanSelectionGate().build(
+                    options=analysis_options,
+                    engagement_mode=mode_label,
+                    selection_index=choice_idx,
+                )
+                selected_analysis = selection["selected"]
+                await emit(run_id, "exit", {"node": node, "selected": selected_analysis})
+                await record(node, {"selected_input": selected_research}, {"analysis": analysis, "selection": selection})
 
-        # Step 5: OutputAgent
-        await _wait_ok(run_id)
-        await emit(run_id, "enter", {"node": "OutputAgent"})
-        final_text = f"{options[choice_idx]}\n\n(Validation: {validation})"
-        await emit(run_id, "exit", {"node": "OutputAgent", "final": final_text})
+            elif node == "ValidationAgent":
+                validation = ValidationAgent().build(selected_analysis)
+                await emit(run_id, "exit", {"node": node, "output": validation})
+                await record(node, {"draft": selected_analysis}, validation)
+
+            elif node == "OutputAgent":
+                final = OutputAgent().build(analysis_choice=selected_analysis, validation=validation)
+                await emit(run_id, "exit", {"node": node, "output": final})
+                await record(node, {"analysis_choice": selected_analysis, "validation": validation}, final)
+                final_text = final["final_text"]
 
         run["status"] = "done"
         await emit(run_id, "done", {"final": final_text})

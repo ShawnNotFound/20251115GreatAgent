@@ -1,9 +1,8 @@
 from langflow.custom import CustomComponent
-from pydantic import BaseModel
-from .trace_logger import log_trace
 
-class ResearchOut(BaseModel):
-    candidates: list[str]
+from langflow_components.__schemas import ResearchOut
+from langflow_components.__trace_logger import log_trace
+
 
 class ResearchAgent(CustomComponent):
     display_name = "Research Agent"

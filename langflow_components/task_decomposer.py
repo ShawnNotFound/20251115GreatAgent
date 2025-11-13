@@ -1,10 +1,8 @@
 from langflow.custom import CustomComponent
-from pydantic import BaseModel, Field
-import json
-from .trace_logger import log_trace
 
-class DecomposeOut(BaseModel):
-    workflow_plan: list[str] = Field(..., description="Agent names in order")
+from langflow_components.__schemas import DecomposeOut
+from langflow_components.__trace_logger import log_trace
+
 
 class TaskDecomposer(CustomComponent):
     display_name = "Task Decomposer"

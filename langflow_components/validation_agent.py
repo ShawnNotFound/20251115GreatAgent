@@ -1,11 +1,8 @@
 from langflow.custom import CustomComponent
-from pydantic import BaseModel
-from .trace_logger import log_trace
 
-class ValidationOut(BaseModel):
-    is_consistent: bool
-    confidence: float
-    notes: str
+from langflow_components.__schemas import ValidationOut
+from langflow_components.__trace_logger import log_trace
+
 
 class ValidationAgent(CustomComponent):
     display_name = "Validation Agent"

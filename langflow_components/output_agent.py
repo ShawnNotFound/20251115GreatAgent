@@ -1,9 +1,8 @@
 from langflow.custom import CustomComponent
-from pydantic import BaseModel
-from .trace_logger import log_trace
 
-class OutputOut(BaseModel):
-    final_text: str
+from langflow_components.__schemas import OutputOut
+from langflow_components.__trace_logger import log_trace
+
 
 class OutputAgent(CustomComponent):
     display_name = "Output Agent"
